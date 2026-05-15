@@ -32,6 +32,8 @@ class Sidebar(QWidget):
     undo_requested            = Signal()
     wand_radius_changed       = Signal(float)
     wand_same_label_changed   = Signal(bool)
+    edl_toggled               = Signal(bool)
+    lod_override_changed      = Signal(object)   # int level or None
     export_ply_requested      = Signal()
     export_json_requested     = Signal()
 
@@ -59,6 +61,7 @@ class Sidebar(QWidget):
         root.addWidget(self._build_options_group())
         root.addWidget(self._build_segment_btn())
         root.addWidget(self._build_results_group())
+        root.addWidget(self._build_performance_group())
         root.addWidget(self._build_edit_group())
         root.addWidget(self._build_legend_group())
         root.addWidget(self._build_export_group())
@@ -144,6 +147,45 @@ class Sidebar(QWidget):
             self._result_labels[label.name] = lbl
 
         return g
+
+    def _build_performance_group(self) -> QGroupBox:
+        g = QGroupBox("Rendering")
+        l = QVBoxLayout(g)
+        l.setSpacing(6)
+
+        # LOD info
+        self._lod_label = QLabel("LOD: —")
+        self._lod_label.setStyleSheet("color:#888;font-size:10px;")
+        l.addWidget(self._lod_label)
+
+        # EDL toggle
+        self._edl_chk = QCheckBox("Eye-Dome Lighting (EDL)")
+        self._edl_chk.setChecked(True)
+        self._edl_chk.setToolTip(
+            "Screen-space depth shader — makes sparse LOD look as dense as full "
+            "resolution.  Highly recommended; costs almost nothing."
+        )
+        self._edl_chk.toggled.connect(self.edl_toggled)
+        l.addWidget(self._edl_chk)
+
+        # LOD override
+        lod_row = QHBoxLayout()
+        lod_row.addWidget(QLabel("LOD override:"))
+        self._lod_combo = QComboBox()
+        self._lod_combo.addItem("Auto", None)
+        for i, label in enumerate(["Full res", "15 mm", "50 mm", "150 mm", "500 mm"]):
+            self._lod_combo.addItem(f"{i} — {label}", i)
+        self._lod_combo.currentIndexChanged.connect(self._on_lod_override)
+        lod_row.addWidget(self._lod_combo)
+        l.addLayout(lod_row)
+
+        return g
+
+    def _on_lod_override(self, _idx) -> None:
+        self.lod_override_changed.emit(self._lod_combo.currentData())
+
+    def set_lod_info(self, msg: str) -> None:
+        self._lod_label.setText(f"Rendering: {msg}")
 
     def _build_edit_group(self) -> QGroupBox:
         g = QGroupBox("Edit Tools")

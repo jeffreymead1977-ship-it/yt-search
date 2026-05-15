@@ -1,21 +1,35 @@
 """
 Embedded PyVista point cloud viewer.
 
-Tools:
-  polygon   — click to place lasso vertices; orbit still works between clicks;
-              double-click or Enter to close; Escape to cancel.
-  limit_box — interactive axis-aligned clip box (PyVista box widget).
-  wand      — click a seed point; KDTree radius-grow selects neighbours.
+Performance features
+--------------------
+- Eye-Dome Lighting (EDL) — screen-space depth shader; makes sparse LOD
+  look as good as full density.  One call to enable.
+- Multi-level LOD — pre-built at load time; at render time the appropriate
+  level (0 finest → 4 coarsest) is chosen from camera distance.
+- Adaptive point size — fewer points on screen → larger points, so the
+  screen always looks filled.
+- Camera-driven rendering — only re-render when the camera moves; a 150 ms
+  debounce after movement ends triggers a full LOD refresh.  During
+  interaction the current cloud stays frozen so the frame rate stays high.
+
+Edit tools
+----------
+- polygon   — click vertices, orbit between them, double-click / Enter to
+              close; numpy ray-casting selection in screen space.
+- limit_box — interactive axis-aligned clip box; hides points outside.
+- wand      — KDTree radius-grow from a clicked seed point.
 """
 from __future__ import annotations
 
 import numpy as np
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QThread
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from ui.polygon_overlay import PolygonOverlay
+from processing.lod import PointCloudLOD, quick_sample, adaptive_point_size
 
 try:
     import pyvista as pv
@@ -28,13 +42,14 @@ except ImportError:
 
 from models.tank_scan import SegmentationResult, Label, LABEL_COLORS
 
-_SEL_RGB     = np.array([255, 230, 40],  dtype=np.uint8)   # selection highlight
-_CLICK_TOL   = 5    # pixels — below this is a "click", above is a "drag/orbit"
-_DBLCLICK_MS = 400  # max ms between two clicks to count as double-click
+_SEL_RGB   = np.array([255, 230, 40], dtype=np.uint8)
+_CLICK_TOL = 5      # pixels — below → click, above → drag/orbit
+_LOD_DEBOUNCE_MS = 150   # ms after camera stops before LOD refresh
 
 
 class ViewerWidget(QWidget):
-    selection_changed = Signal(int)   # count of currently selected points
+    selection_changed  = Signal(int)    # count of selected points
+    lod_info_changed   = Signal(str)    # e.g. "LOD 2 — 1.2 M pts"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,34 +57,45 @@ class ViewerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         # ── core state ────────────────────────────────────────────────────
-        self._pts:      Optional[np.ndarray] = None    # (N,3) float64
-        self._labels:   Optional[np.ndarray] = None    # (N,)  int8
-        self._selected: Optional[np.ndarray] = None    # (N,)  bool
-        self._clip_mask:Optional[np.ndarray] = None    # (N,)  bool  (None = all visible)
+        self._pts:       Optional[np.ndarray] = None
+        self._labels:    Optional[np.ndarray] = None
+        self._selected:  Optional[np.ndarray] = None
+        self._clip_mask: Optional[np.ndarray] = None
         self._visible_indices: Optional[np.ndarray] = None
         self._undo_stack: list[np.ndarray] = []
         self._cloud_actor = None
 
+        # ── LOD state ─────────────────────────────────────────────────────
+        self._lod: Optional[PointCloudLOD] = None
+        self._lod_thread: Optional[QThread] = None
+        self._lod_worker = None
+        self._edl_enabled = True
+        self._force_lod:   Optional[int] = None
+        self._lod_timer = QTimer(self)
+        self._lod_timer.setSingleShot(True)
+        self._lod_timer.timeout.connect(self._on_lod_timer)
+        self._cam_obs = None
+
         # ── tool state ────────────────────────────────────────────────────
-        self._tool = "none"                  # "polygon" | "limit_box" | "wand"
-        self._polygon_verts: list[tuple[int,int]] = []
-        self._press_pos: Optional[tuple[int,int]] = None
-        self._last_click_time = 0            # ms timestamp
-        self._press_obs  = None
-        self._release_obs = None
-        self._key_obs    = None
-        self._wand_radius = 0.3              # metres, configurable
+        self._tool = "none"
+        self._polygon_verts: list[tuple[int, int]] = []
+        self._press_pos: Optional[tuple[int, int]] = None
+        self._press_obs = self._release_obs = self._key_obs = None
+        self._wand_radius     = 0.30
         self._wand_same_label = True
-        self._kdtree = None                  # lazy-built scipy KDTree
-        self._clip_active = False
+        self._kdtree          = None
+        self._clip_active     = False
 
         if _PYVISTA_OK:
             self._plotter = QtInteractor(self)
             self._plotter.set_background("#0f1117")
+            if self._edl_enabled:
+                self._plotter.enable_eye_dome_lighting()
             layout.addWidget(self._plotter.interactor)
             self._overlay = PolygonOverlay(self)
             self._overlay.raise_()
             self._plotter.interactor.installEventFilter(self)
+            self._install_camera_observer()
             self._show_placeholder()
         else:
             self._plotter = None
@@ -92,49 +118,47 @@ class ViewerWidget(QWidget):
         self._clip_mask = None
         self._undo_stack.clear()
         self._kdtree = None
+        self._lod = None
         self._polygon_verts.clear()
         if self._overlay:
             self._overlay.clear()
-        self._rebuild_cloud(reset_camera=True)
+
+        # Show a quick preview immediately, then build LOD in background
+        self._visible_indices = quick_sample(self._pts, 200_000)
+        self._render_indices(self._visible_indices, reset_camera=True)
+        self.lod_info_changed.emit("Building LOD…")
+
+        self._start_lod_build()
 
     def set_tool(self, tool: str) -> None:
-        """Switch active tool. Pass "none" to disable all tools."""
         if not self._plotter or self._pts is None:
             return
-        previous = self._tool
+        prev = self._tool
         self._tool = tool
 
-        # Tear down previous tool
-        if previous == "polygon":
+        if prev == "polygon":
             self._remove_vtk_observers()
             self._polygon_verts.clear()
             if self._overlay:
                 self._overlay.clear()
-        elif previous == "limit_box":
-            pass   # box widget persists until explicitly reset
-        elif previous == "wand":
+        elif prev == "wand":
             self._remove_vtk_observers()
 
-        # Set up new tool
-        if tool == "polygon":
+        if tool in ("polygon", "wand"):
             self._install_vtk_observers()
         elif tool == "limit_box":
             self._activate_limit_box()
-        elif tool == "wand":
-            self._install_vtk_observers()
 
     def apply_label(self, label_value: int) -> None:
-        if self._labels is None or self._selected is None:
-            return
-        if not self._selected.any():
+        if self._labels is None or not (self._selected is not None and self._selected.any()):
             return
         self._undo_stack.append(self._labels.copy())
         self._labels[self._selected] = label_value
         self._selected[:] = False
         self._kdtree = None
+        self._polygon_verts.clear()
         if self._overlay:
             self._overlay.clear()
-        self._polygon_verts.clear()
         self._refresh_display()
         self.selection_changed.emit(0)
 
@@ -148,14 +172,13 @@ class ViewerWidget(QWidget):
         self.selection_changed.emit(0)
 
     def reset_limit_box(self) -> None:
-        self._clip_mask = None
+        self._clip_mask  = None
         self._clip_active = False
-        if self._plotter:
-            try:
-                self._plotter.clear_box_widgets()
-            except Exception:
-                pass
-        self._rebuild_cloud(reset_camera=False)
+        try:
+            self._plotter.clear_box_widgets()
+        except Exception:
+            pass
+        self._full_lod_refresh()
 
     def undo(self) -> None:
         if not self._undo_stack:
@@ -170,11 +193,73 @@ class ViewerWidget(QWidget):
     def can_undo(self) -> bool:
         return bool(self._undo_stack)
 
-    def set_wand_radius(self, radius_m: float) -> None:
-        self._wand_radius = radius_m
+    def set_edl(self, enabled: bool) -> None:
+        self._edl_enabled = enabled
+        if not self._plotter:
+            return
+        if enabled:
+            self._plotter.enable_eye_dome_lighting()
+        else:
+            self._plotter.disable_eye_dome_lighting()
+        self._plotter.render()
 
-    def set_wand_same_label(self, same_label: bool) -> None:
-        self._wand_same_label = same_label
+    def set_force_lod(self, level: Optional[int]) -> None:
+        """Override automatic LOD level. None = automatic."""
+        self._force_lod = level
+        self._full_lod_refresh()
+
+    def set_wand_radius(self, r: float) -> None:
+        self._wand_radius = r
+
+    def set_wand_same_label(self, v: bool) -> None:
+        self._wand_same_label = v
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LOD build
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _start_lod_build(self) -> None:
+        if self._pts is None:
+            return
+        # Abort previous build if running
+        if self._lod_thread and self._lod_thread.isRunning():
+            self._lod_thread.quit()
+            self._lod_thread.wait(1000)
+
+        from workers.lod_worker import LODWorker
+
+        self._lod_thread = QThread(self)
+        self._lod_worker = LODWorker(self._pts)
+        self._lod_worker.moveToThread(self._lod_thread)
+        self._lod_thread.started.connect(self._lod_worker.run)
+        self._lod_worker.progress.connect(lambda m: self.lod_info_changed.emit(m))
+        self._lod_worker.finished.connect(self._on_lod_built)
+        self._lod_worker.error.connect(lambda e: self.lod_info_changed.emit(f"LOD error: {e}"))
+        self._lod_worker.finished.connect(self._lod_thread.quit)
+        self._lod_thread.start()
+
+    def _on_lod_built(self, lod: PointCloudLOD) -> None:
+        self._lod = lod
+        self._lod_thread = None
+        self._lod_worker = None
+        self._full_lod_refresh()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Camera observer + debounce
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _install_camera_observer(self) -> None:
+        self._cam_obs = self._plotter.iren.AddObserver(
+            "EndInteractionEvent", self._on_camera_moved
+        )
+
+    def _on_camera_moved(self, *_) -> None:
+        # Debounce: re-render LOD 150 ms after camera stops
+        self._lod_timer.stop()
+        self._lod_timer.start(_LOD_DEBOUNCE_MS)
+
+    def _on_lod_timer(self) -> None:
+        self._full_lod_refresh()
 
     # ══════════════════════════════════════════════════════════════════════
     # VTK observers (polygon + wand)
@@ -204,13 +289,11 @@ class ViewerWidget(QWidget):
         if self._press_pos is None:
             return
         pos = caller.GetEventPosition()
-        dx  = abs(pos[0] - self._press_pos[0])
-        dy  = abs(pos[1] - self._press_pos[1])
+        if abs(pos[0]-self._press_pos[0]) > _CLICK_TOL or \
+           abs(pos[1]-self._press_pos[1]) > _CLICK_TOL:
+            self._press_pos = None
+            return   # it was a drag
         self._press_pos = None
-
-        if dx > _CLICK_TOL or dy > _CLICK_TOL:
-            return   # it was a drag/orbit — ignore
-
         if self._tool == "polygon":
             self._polygon_add_vertex(pos)
         elif self._tool == "wand":
@@ -218,36 +301,29 @@ class ViewerWidget(QWidget):
 
     def _on_key_press(self, caller, _event) -> None:
         key = caller.GetKeySym()
-        if key in ("Return", "KP_Enter"):
-            if self._tool == "polygon":
-                self._polygon_close()
+        if key in ("Return", "KP_Enter") and self._tool == "polygon":
+            self._polygon_close()
         elif key == "Escape":
             self._polygon_verts.clear()
             if self._overlay:
                 self._overlay.clear()
 
     # ══════════════════════════════════════════════════════════════════════
-    # Qt event filter — double-click + mouse-move tracking for overlay
+    # Qt event filter
     # ══════════════════════════════════════════════════════════════════════
 
     def eventFilter(self, obj, event) -> bool:
         if obj is not self._plotter.interactor:
             return False
-
         etype = event.type()
-
         if etype == QEvent.MouseButtonDblClick and self._tool == "polygon":
-            # Remove the last vertex (which was added on the first click of
-            # the double-click) then close
             if self._polygon_verts:
                 self._polygon_verts.pop()
             self._polygon_close()
-            return True   # consume so VTK doesn't treat it as two clicks
-
+            return True
         if etype == QEvent.MouseMove and self._tool == "polygon" and self._polygon_verts:
             p = event.position().toPoint()
             self._overlay.set_vertices(self._polygon_verts, (p.x(), p.y()))
-
         return False
 
     def resizeEvent(self, event) -> None:
@@ -259,8 +335,8 @@ class ViewerWidget(QWidget):
     # Polygon lasso
     # ══════════════════════════════════════════════════════════════════════
 
-    def _polygon_add_vertex(self, screen_pos: tuple[int, int]) -> None:
-        self._polygon_verts.append(screen_pos)
+    def _polygon_add_vertex(self, pos: tuple[int, int]) -> None:
+        self._polygon_verts.append(pos)
         if self._overlay:
             self._overlay.set_vertices(self._polygon_verts)
 
@@ -280,7 +356,6 @@ class ViewerWidget(QWidget):
         in_poly     = _pts_in_polygon(self._polygon_verts, disp)
         hit_vis     = front & in_poly
 
-        # Map visible indices back to full array
         shift = self._plotter.iren.GetShiftKey()
         if shift:
             self._selected[vis_idx[hit_vis]] = True
@@ -315,13 +390,14 @@ class ViewerWidget(QWidget):
         )
 
     def _on_box_changed(self, box, *_) -> None:
-        b = box.bounds   # (xmin, xmax, ymin, ymax, zmin, zmax)
-        pts = self._pts
+        b = box.bounds
+        p = self._pts
         self._clip_mask = (
-            (pts[:, 0] >= b[0]) & (pts[:, 0] <= b[1]) &
-            (pts[:, 1] >= b[2]) & (pts[:, 1] <= b[3]) &
-            (pts[:, 2] >= b[4]) & (pts[:, 2] <= b[5])
+            (p[:, 0] >= b[0]) & (p[:, 0] <= b[1]) &
+            (p[:, 1] >= b[2]) & (p[:, 1] <= b[3]) &
+            (p[:, 2] >= b[4]) & (p[:, 2] <= b[5])
         )
+        self._kdtree = None
         self._refresh_display()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -331,43 +407,37 @@ class ViewerWidget(QWidget):
     def _wand_pick(self, screen_pos: tuple[int, int]) -> None:
         if self._pts is None:
             return
-
-        # Find the closest rendered point using vtkPointPicker
         picker = vtkPointPicker()
         picker.SetTolerance(0.025)
-        picked = picker.Pick(screen_pos[0], screen_pos[1], 0,
-                             self._plotter.renderer)
-        if not picked:
+        if not picker.Pick(screen_pos[0], screen_pos[1], 0, self._plotter.renderer):
             return
         picked_id = picker.GetPointId()
         if picked_id < 0:
             return
 
-        # Map from rendered (visible) index to full array index
         vis_idx = self._visible_indices
         if vis_idx is None or picked_id >= len(vis_idx):
             return
         seed_idx   = int(vis_idx[picked_id])
-        seed_pt    = self._pts[seed_idx]
         seed_label = int(self._labels[seed_idx])
 
-        # Build KDTree if needed (only over visible points)
         if self._kdtree is None:
             from scipy.spatial import KDTree
-            self._kdtree = KDTree(self._pts[vis_idx])
+            search_pts = self._pts if self._clip_mask is None \
+                         else self._pts[self._clip_mask]
+            self._kdtree_base = (
+                np.arange(len(self._pts)) if self._clip_mask is None
+                else np.where(self._clip_mask)[0]
+            )
+            self._kdtree = KDTree(search_pts)
 
-        # Radius search
-        hit_vis = np.array(
-            self._kdtree.query_ball_point(seed_pt, self._wand_radius),
+        hits_local = np.array(
+            self._kdtree.query_ball_point(self._pts[seed_idx], self._wand_radius),
             dtype=np.intp,
         )
-        if not len(hit_vis):
+        if not len(hits_local):
             return
-
-        # Map back to full indices
-        hit_full = vis_idx[hit_vis]
-
-        # Optionally restrict to same current label
+        hit_full = self._kdtree_base[hits_local]
         if self._wand_same_label:
             hit_full = hit_full[self._labels[hit_full] == seed_label]
 
@@ -375,12 +445,11 @@ class ViewerWidget(QWidget):
         if not shift:
             self._selected[:] = False
         self._selected[hit_full] = True
-
         self._refresh_display()
         self.selection_changed.emit(int(self._selected.sum()))
 
     # ══════════════════════════════════════════════════════════════════════
-    # Rendering helpers
+    # Rendering
     # ══════════════════════════════════════════════════════════════════════
 
     def _color_array(self) -> np.ndarray:
@@ -392,33 +461,63 @@ class ViewerWidget(QWidget):
             colors[self._selected] = _SEL_RGB
         return colors
 
-    def _compute_visible(self) -> np.ndarray:
-        if self._clip_mask is not None:
-            return np.where(self._clip_mask)[0]
-        return np.arange(len(self._pts))
-
-    def _safe_cam(self):
-        try:
-            return self._plotter.camera_position
-        except Exception:
-            return None
-
-    def _rebuild_cloud(self, reset_camera: bool = False) -> None:
+    def _full_lod_refresh(self) -> None:
+        """Pick LOD level from camera position and re-render."""
         if not self._plotter or self._pts is None:
             return
+
+        if self._lod is not None:
+            try:
+                cam = np.array(self._plotter.camera_position[0])
+            except Exception:
+                cam = self._lod.center + np.array([0, 0, self._lod.radius * 3])
+            idx, lv = self._lod.select(
+                cam,
+                clip_mask=self._clip_mask,
+                force_level=self._force_lod,
+            )
+            n_shown = len(idx)
+            level_names = ["Full res", "15 mm", "50 mm", "150 mm", "500 mm"]
+            name = level_names[min(lv, len(level_names)-1)]
+            self.lod_info_changed.emit(f"{name} — {n_shown:,} pts")
+        else:
+            idx = quick_sample(self._pts, 200_000)
+            if self._clip_mask is not None:
+                idx = idx[self._clip_mask[idx]]
+            self.lod_info_changed.emit(f"Preview — {len(idx):,} pts")
+
+        self._visible_indices = idx
+        self._render_indices(idx, reset_camera=False)
+
+    def _refresh_display(self) -> None:
+        """Refresh colours without changing LOD or camera."""
+        if self._visible_indices is not None:
+            self._render_indices(self._visible_indices, reset_camera=False)
+
+    def _render_indices(self, idx: np.ndarray, reset_camera: bool = False) -> None:
         cam = None if reset_camera else self._safe_cam()
+
         if self._cloud_actor is not None:
             self._plotter.remove_actor(self._cloud_actor)
             self._cloud_actor = None
 
-        vis_idx = self._compute_visible()
-        self._visible_indices = vis_idx
+        if len(idx) == 0:
+            self._plotter.render()
+            return
 
-        cloud = pv.PolyData(self._pts[vis_idx].astype(np.float32))
-        cloud['colors'] = self._color_array()[vis_idx]
+        pts_vis    = self._pts[idx].astype(np.float32)
+        colors_vis = self._color_array()[idx]
+
+        cloud = pv.PolyData(pts_vis)
+        cloud['colors'] = colors_vis
+
         self._cloud_actor = self._plotter.add_mesh(
-            cloud, scalars='colors', rgb=True,
-            point_size=2, render_points_as_spheres=False, lighting=False,
+            cloud,
+            scalars='colors',
+            rgb=True,
+            point_size=adaptive_point_size(len(idx)),
+            render_points_as_spheres=False,
+            lighting=False,
         )
         if cam:
             self._plotter.camera_position = cam
@@ -426,9 +525,11 @@ class ViewerWidget(QWidget):
             self._plotter.reset_camera()
         self._plotter.render()
 
-    def _refresh_display(self) -> None:
-        """Update colors without touching box widget or camera."""
-        self._rebuild_cloud(reset_camera=False)
+    def _safe_cam(self):
+        try:
+            return self._plotter.camera_position
+        except Exception:
+            return None
 
     def _show_placeholder(self) -> None:
         self._plotter.clear()
@@ -439,24 +540,20 @@ class ViewerWidget(QWidget):
         self._plotter.render()
 
     # ══════════════════════════════════════════════════════════════════════
-    # Projection helpers
+    # Screen-space projection helpers
     # ══════════════════════════════════════════════════════════════════════
 
     def _world_to_display(self, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Project world-space points to display pixels.
-        Returns (display_xy (N,2), in_front (N,bool)).
-        """
         renderer = self._plotter.renderer
         camera   = renderer.GetActiveCamera()
         aspect   = renderer.GetTiledAspectRatio()
         mvp      = camera.GetCompositeProjectionTransformMatrix(aspect, -1.0, 1.0)
         M = np.array([[mvp.GetElement(i, j) for j in range(4)] for i in range(4)])
 
-        n      = len(pts)
-        pts_h  = np.ones((n, 4))
+        n     = len(pts)
+        pts_h = np.ones((n, 4))
         pts_h[:, :3] = pts
-        clip   = (M @ pts_h.T).T          # (N, 4)
+        clip  = (M @ pts_h.T).T
 
         w        = clip[:, 3]
         in_front = w > 1e-6
@@ -476,25 +573,27 @@ class ViewerWidget(QWidget):
         return disp, in_front
 
     # ── Cleanup ────────────────────────────────────────────────────────────
+
     def closeEvent(self, event) -> None:
+        self._lod_timer.stop()
+        if self._lod_thread and self._lod_thread.isRunning():
+            self._lod_thread.quit()
+            self._lod_thread.wait(2000)
         if self._plotter:
             self._plotter.close()
         super().closeEvent(event)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Pure-numpy point-in-polygon  (ray-casting, no external deps)
+# Pure-numpy point-in-polygon (ray-casting, no external deps)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _pts_in_polygon(
-    polygon: list[tuple[int, int]],
-    points:  np.ndarray,           # (N, 2)
-) -> np.ndarray:
-    poly  = np.asarray(polygon, dtype=np.float64)
+def _pts_in_polygon(polygon: list[tuple[int,int]], points: np.ndarray) -> np.ndarray:
+    poly   = np.asarray(polygon, dtype=np.float64)
     px, py = points[:, 0], points[:, 1]
     n_v    = len(poly)
     inside = np.zeros(len(px), dtype=bool)
-    j = n_v - 1
+    j      = n_v - 1
     for i in range(n_v):
         xi, yi = poly[i]
         xj, yj = poly[j]

@@ -146,11 +146,17 @@ class MainWindow(QMainWindow):
         self._sidebar.undo_requested.connect(self._undo)
         self._sidebar.wand_radius_changed.connect(self._viewer.set_wand_radius)
         self._sidebar.wand_same_label_changed.connect(self._viewer.set_wand_same_label)
+        self._sidebar.edl_toggled.connect(self._viewer.set_edl)
+        self._sidebar.lod_override_changed.connect(self._viewer.set_force_lod)
         self._sidebar.export_ply_requested.connect(self._export_ply)
         self._sidebar.export_json_requested.connect(self._export_json)
 
         self._viewer = ViewerWidget()
         self._viewer.selection_changed.connect(self._on_selection_changed)
+        self._viewer.lod_info_changed.connect(self._sidebar.set_lod_info)
+        self._viewer.lod_info_changed.connect(
+            lambda m: self._status(m) if "LOD" in m or "Building" in m else None
+        )
 
         splitter.addWidget(self._sidebar)
         splitter.addWidget(self._viewer)
