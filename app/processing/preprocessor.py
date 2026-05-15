@@ -2,21 +2,15 @@
 import numpy as np
 import open3d as o3d
 
-
-# Tunable defaults
-VOXEL_SIZE_M = 0.01       # 10 mm
-OUTLIER_K = 20
-OUTLIER_STD = 2.0
+VOXEL_SIZE_M = 0.01
+OUTLIER_K    = 20
+OUTLIER_STD  = 2.0
 
 
-def to_o3d(xyz: np.ndarray) -> o3d.geometry.PointCloud:
+def _to_o3d(xyz: np.ndarray) -> o3d.geometry.PointCloud:
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     return pcd
-
-
-def from_o3d(pcd: o3d.geometry.PointCloud) -> np.ndarray:
-    return np.asarray(pcd.points)
 
 
 def preprocess(
@@ -26,17 +20,15 @@ def preprocess(
     outlier_std: float = OUTLIER_STD,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (inlier_xyz, outlier_xyz) after downsampling and denoising."""
-    pcd = to_o3d(xyz)
+    pcd = _to_o3d(xyz)
 
     if voxel_size > 0:
         pcd = pcd.voxel_down_sample(voxel_size)
 
-    all_xyz = from_o3d(pcd)
-
+    all_xyz = np.asarray(pcd.points)
     _, inlier_idx = pcd.remove_statistical_outlier(
         nb_neighbors=outlier_k, std_ratio=outlier_std
     )
-    inlier_mask = np.zeros(len(all_xyz), dtype=bool)
-    inlier_mask[inlier_idx] = True
-
-    return all_xyz[inlier_mask], all_xyz[~inlier_mask]
+    mask = np.zeros(len(all_xyz), dtype=bool)
+    mask[inlier_idx] = True
+    return all_xyz[mask], all_xyz[~mask]

@@ -1,4 +1,4 @@
-"""Read an E57 file and return a single merged (N,3) XYZ numpy array."""
+"""Read an E57 file and return a merged (N, 3) XYZ float64 array."""
 import pye57
 import numpy as np
 from pathlib import Path
@@ -23,11 +23,10 @@ def load_e57(path: str | Path) -> tuple[np.ndarray, dict]:
             data["cartesianY"],
             data["cartesianZ"],
         ]).astype(np.float64)
-        # Drop invalid points (NaN or cartesianInvalidState != 0)
+
         if "cartesianInvalidState" in data:
-            valid = data["cartesianInvalidState"] == 0
-            xyz = xyz[valid]
-        finite = np.all(np.isfinite(xyz), axis=1)
-        clouds.append(xyz[finite])
+            xyz = xyz[data["cartesianInvalidState"] == 0]
+
+        clouds.append(xyz[np.all(np.isfinite(xyz), axis=1)])
 
     return np.concatenate(clouds, axis=0), metadata
