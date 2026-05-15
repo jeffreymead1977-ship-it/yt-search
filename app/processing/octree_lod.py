@@ -1,5 +1,4 @@
-"""
-Spatially-adaptive octree LOD (Potree-style).
+"""Spatially-adaptive octree LOD (Potree-style).
 
 Each node owns a bounding sphere. At render time nodes whose projected sphere
 radius is smaller than threshold_px render their own coarse sample; larger
@@ -9,7 +8,7 @@ GPU budget stays at ~2-4 M points regardless of cloud size.
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 
@@ -31,7 +30,6 @@ def build_octree(
 ) -> OctreeNode:
     """Build an octree over pts and return the root OctreeNode."""
     rng = np.random.default_rng(0)
-
     total = [0]
 
     def _build(indices: np.ndarray, depth: int) -> OctreeNode:
@@ -47,14 +45,14 @@ def build_octree(
 
         if depth >= max_depth or n <= min_pts:
             node = OctreeNode(center=center, half_diag=half_diag,
-                              sample=sample, children=[None]*8, is_leaf=True)
+                              sample=sample, children=[None] * 8, is_leaf=True)
             total[0] += n
             if progress_cb and total[0] % 200_000 < n:
                 progress_cb(f"Building octree… {total[0]:,} pts indexed")
             return node
 
         mid = center
-        children: list[OctreeNode | None] = []
+        children: list = []
         for oct_i in range(8):
             dx = 1 if (oct_i & 1) else 0
             dy = 1 if (oct_i & 2) else 0
@@ -83,30 +81,26 @@ def build_octree(
 
 
 def get_frustum_planes(renderer) -> np.ndarray:
-    """
-    Extract 6 clip planes from VTK renderer using Gribb-Hartmann method.
+    """Extract 6 clip planes from a VTK renderer using Gribb-Hartmann method.
+
     Returns (6, 4) float64 array; plane equation ax+by+cz+d — inside if >= 0.
     """
     camera = renderer.GetActiveCamera()
     aspect = renderer.GetTiledAspectRatio()
     mvp_vtk = camera.GetCompositeProjectionTransformMatrix(aspect, -1.0, 1.0)
-    M = np.array([[mvp_vtk.GetElement(r, c) for c in range(4)] for r in range(4)], dtype=np.float64)
+    M = np.array(
+        [[mvp_vtk.GetElement(r, c) for c in range(4)] for r in range(4)],
+        dtype=np.float64,
+    )
 
     planes = np.zeros((6, 4), dtype=np.float64)
-    # Left   : row3 + row0
-    planes[0] = M[3] + M[0]
-    # Right  : row3 - row0
-    planes[1] = M[3] - M[0]
-    # Bottom : row3 + row1
-    planes[2] = M[3] + M[1]
-    # Top    : row3 - row1
-    planes[3] = M[3] - M[1]
-    # Near   : row3 + row2
-    planes[4] = M[3] + M[2]
-    # Far    : row3 - row2
-    planes[5] = M[3] - M[2]
+    planes[0] = M[3] + M[0]   # left
+    planes[1] = M[3] - M[0]   # right
+    planes[2] = M[3] + M[1]   # bottom
+    planes[3] = M[3] - M[1]   # top
+    planes[4] = M[3] + M[2]   # near
+    planes[5] = M[3] - M[2]   # far
 
-    # Normalise so the distance value is in world units
     norms = np.linalg.norm(planes[:, :3], axis=1, keepdims=True)
     norms = np.where(norms < 1e-12, 1.0, norms)
     planes /= norms
@@ -122,8 +116,8 @@ def collect_indices(
     threshold_px: float = 80.0,
     max_pts: int = 4_000_000,
 ) -> np.ndarray:
-    """
-    DFS over the octree, frustum-culling and screen-size testing each node.
+    """DFS over the octree, frustum-culling and screen-size testing each node.
+
     Returns concatenated index array (into original pts).
     """
     collected: list[np.ndarray] = []
@@ -146,7 +140,7 @@ def collect_indices(
         dist = float(np.linalg.norm(camera_pos - c))
         if dist < 1e-6:
             dist = 1e-6
-        ss = hd / dist * viewport_h / (2.0 * fov_half_tan)
+        ss = hd / dist * viewport_h / (2.0 * max(fov_half_tan, 1e-6))
 
         if ss < threshold_px or node.is_leaf:
             rem  = max_pts - total[0]
@@ -166,6 +160,7 @@ def collect_indices(
 
 
 def adaptive_point_size(n: int) -> float:
+    """Return a point-size hint based on how many points are on screen."""
     if   n <    50_000: return 5.0
     elif n <   200_000: return 4.0
     elif n <   600_000: return 3.0

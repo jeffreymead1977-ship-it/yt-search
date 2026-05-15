@@ -1,5 +1,4 @@
-"""
-Extract panoramic images embedded in an E57 file and prepare them for sphere rendering.
+"""Extract panoramic images embedded in an E57 file and prepare them for sphere rendering.
 
 E57 binary format:
   - 48-byte file header: signature(8) + major(u32) + minor(u32) +
@@ -56,20 +55,8 @@ def _read_blob(f, file_offset: int, length: int) -> bytes:
     return f.read(length)
 
 
-def _find_translation(elem: ET.Element) -> np.ndarray:
-    """Look for pose/translation x,y,z under elem."""
-    ns_strip = lambda tag: tag.split("}")[-1] if "}" in tag else tag
-    for child in elem.iter():
-        if ns_strip(child.tag) == "translation":
-            try:
-                x = float(child.find("*[@type='Float'][@name='x']") or
-                           _find_named(child, "x") or 0)
-                y = float(_find_named(child, "y") or 0)
-                z = float(_find_named(child, "z") or 0)
-                return np.array([x, y, z], dtype=np.float64)
-            except Exception:
-                pass
-    return np.zeros(3, dtype=np.float64)
+def _ns_tag(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
 
 
 def _find_named(parent: ET.Element, name: str) -> Optional[str]:
@@ -79,8 +66,18 @@ def _find_named(parent: ET.Element, name: str) -> Optional[str]:
     return None
 
 
-def _ns_tag(tag: str) -> str:
-    return tag.split("}")[-1] if "}" in tag else tag
+def _find_translation(elem: ET.Element) -> np.ndarray:
+    """Look for pose/translation x,y,z under elem."""
+    for child in elem.iter():
+        if _ns_tag(child.tag) == "translation":
+            try:
+                x = float(_find_named(child, "x") or 0)
+                y = float(_find_named(child, "y") or 0)
+                z = float(_find_named(child, "z") or 0)
+                return np.array([x, y, z], dtype=np.float64)
+            except Exception:
+                pass
+    return np.zeros(3, dtype=np.float64)
 
 
 def _decode_image(data: bytes) -> Optional[np.ndarray]:
@@ -93,6 +90,7 @@ def _decode_image(data: bytes) -> Optional[np.ndarray]:
 
 
 def extract_panoramas(path: str) -> list[PanoramaData]:
+    """Extract all panoramic images from an E57 file. Returns [] on any failure."""
     try:
         with open(path, "rb") as f:
             header_bytes = f.read(48)
@@ -111,7 +109,6 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
             results: list[PanoramaData] = []
             scan_index = 0
 
-            # Walk e57Root → data3D → vectorChild → images2D → ...
             _IMAGE_TAGS  = {"jpegImage", "pngImage"}
             _SPHERE_TAGS = {"sphericalRepresentation", "equirectangularRepresentation"}
 
@@ -122,7 +119,6 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
                 nonlocal scan_index
                 for scan_el in data3d_list:
                     pos = _find_translation(scan_el)
-                    # Look for images2D child
                     images2d = None
                     for ch, tag in _iter_elem(scan_el):
                         if tag == "images2D":
@@ -132,8 +128,7 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
                         scan_index += 1
                         continue
 
-                    for img_el, img_tag in _iter_elem(images2d):
-                        # Find spherical/equirectangular representation
+                    for img_el, _img_tag in _iter_elem(images2d):
                         repr_el = None
                         for ch, tag in _iter_elem(img_el):
                             if tag in _SPHERE_TAGS:
@@ -141,14 +136,12 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
                                 break
                         target = repr_el if repr_el is not None else img_el
 
-                        # Find image blob element
                         blob_el = None
                         for ch, tag in _iter_elem(target):
                             if tag in _IMAGE_TAGS:
                                 blob_el = ch
                                 break
                         if blob_el is None:
-                            # Try any child with fileOffset
                             for ch in target.iter():
                                 if ch.get("fileOffset") is not None:
                                     blob_el = ch
@@ -180,7 +173,6 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
 
                     scan_index += 1
 
-            # Locate data3D in the XML tree
             data3d_el = None
             for el in root_el.iter():
                 if _ns_tag(el.tag) == "data3D":
@@ -190,7 +182,7 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
             if data3d_el is not None:
                 _search_images(list(data3d_el))
             else:
-                # Fallback: look for any element with 'jpegImage'/'pngImage'
+                # Fallback: look for any element with jpegImage/pngImage recursively
                 for el in root_el.iter():
                     if _ns_tag(el.tag) in _IMAGE_TAGS:
                         try:
@@ -219,14 +211,12 @@ def extract_panoramas(path: str) -> list[PanoramaData]:
 
 
 def make_panorama_sphere(pano: PanoramaData, radius: float = 80.0):
-    """
-    Returns (pv.PolyData sphere, pv.Texture) ready for plotter.add_mesh.
-    """
+    """Return (pv.PolyData sphere, pv.Texture) ready for plotter.add_mesh."""
     if not _PYVISTA_OK:
         raise RuntimeError("pyvista not available")
     sphere = pv.Sphere(
         radius=radius,
-        center=tuple(pano.scanner_pos.tolist()),
+        center=tuple(float(v) for v in pano.scanner_pos),
         theta_resolution=180,
         phi_resolution=90,
     )

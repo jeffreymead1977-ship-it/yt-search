@@ -1,7 +1,9 @@
 """Background QThread worker to build octree LOD after segmentation."""
 from PySide6.QtCore import QObject, Signal, Slot
-from processing.octree_lod import build_octree, OctreeNode
+
 import numpy as np
+
+from processing.octree_lod import build_octree, OctreeNode
 
 
 class LODWorker(QObject):

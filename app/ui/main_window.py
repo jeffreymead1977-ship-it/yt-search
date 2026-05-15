@@ -66,6 +66,26 @@ QDoubleSpinBox {
     padding: 3px 6px;
     min-height: 20px;
 }
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #2d3040;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #3d4ecc;
+    border: 1px solid #5060dd;
+    width: 12px;
+    height: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+}
+QSlider::sub-page:horizontal { background: #3d4ecc; border-radius: 2px; }
+QListWidget {
+    background: #13151f;
+    border: 1px solid #2d3040;
+    border-radius: 3px;
+    color: #d0d0d0;
+}
 QSplitter::handle { background: #2d3040; width: 2px; }
 QStatusBar { background: #13151f; border-top: 1px solid #2d3040; color: #aaa; font-size: 11px; }
 QProgressBar {
@@ -99,6 +119,7 @@ class MainWindow(QMainWindow):
         self._current_result = None
         self._thread: QThread | None = None
         self._worker: SegmentationWorker | None = None
+        self._panoramas: list = []
 
         self._build_menu()
         self._build_central()
@@ -111,20 +132,20 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
 
         file_menu = mb.addMenu("&File")
-        self._add_action(file_menu, "&Open E57…",          self._open_file,    "Ctrl+O")
+        self._add_action(file_menu, "&Open E57…",           self._open_file,    "Ctrl+O")
         file_menu.addSeparator()
         self._add_action(file_menu, "Export Labeled &PLY…", self._export_ply)
-        self._add_action(file_menu, "Export Summary &JSON…",self._export_json)
+        self._add_action(file_menu, "Export Summary &JSON…", self._export_json)
         file_menu.addSeparator()
-        self._add_action(file_menu, "&Quit",                self.close,         "Ctrl+Q")
+        self._add_action(file_menu, "&Quit",                 self.close,         "Ctrl+Q")
 
         edit_menu = mb.addMenu("&Edit")
-        self._add_action(edit_menu, "&Undo",                self._undo,         "Ctrl+Z")
+        self._add_action(edit_menu, "&Undo",             self._undo,            "Ctrl+Z")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "Clear &Selection",     self._clear_selection)
+        self._add_action(edit_menu, "Clear &Selection",  self._clear_selection)
 
         view_menu = mb.addMenu("&View")
-        self._add_action(view_menu, "&Reset Camera",        self._reset_camera, "R")
+        self._add_action(view_menu, "&Reset Camera",     self._reset_camera,    "R")
 
     def _add_action(self, menu, label, slot, shortcut=None):
         a = QAction(label, self)
@@ -136,7 +157,10 @@ class MainWindow(QMainWindow):
     def _build_central(self):
         splitter = QSplitter(Qt.Horizontal)
 
+        self._viewer  = ViewerWidget()
         self._sidebar = Sidebar()
+
+        # ── Existing connections ───────────────────────────────────────────
         self._sidebar.open_requested.connect(self._open_file)
         self._sidebar.segment_requested.connect(self._start_segmentation)
         self._sidebar.tool_activated.connect(self._on_tool_activated)
@@ -151,11 +175,26 @@ class MainWindow(QMainWindow):
         self._sidebar.export_ply_requested.connect(self._export_ply)
         self._sidebar.export_json_requested.connect(self._export_json)
 
-        self._viewer = ViewerWidget()
+        # ── Rendering tunables ────────────────────────────────────────────
+        self._sidebar.lod_threshold_changed.connect(self._viewer.set_lod_threshold)
+        self._sidebar.max_pts_changed.connect(self._viewer.set_max_pts)
+        self._sidebar.point_size_changed.connect(self._viewer.set_point_size_override)
+        self._sidebar.bg_color_changed.connect(self._viewer.set_background_color)
+
+        # ── Panorama ──────────────────────────────────────────────────────
+        self._sidebar.pano_show_requested.connect(self._on_pano_show)
+        self._sidebar.pano_hide_requested.connect(self._viewer.hide_panorama)
+
+        # ── Measurements ──────────────────────────────────────────────────
+        self._sidebar.measure_tool_changed.connect(self._viewer.set_measure_tool)
+        self._sidebar.clear_measurements_requested.connect(self._viewer.clear_measurements)
+        self._viewer.measurement_done.connect(self._on_measurement_done)
+
+        # ── Viewer → sidebar ──────────────────────────────────────────────
         self._viewer.selection_changed.connect(self._on_selection_changed)
         self._viewer.lod_info_changed.connect(self._sidebar.set_lod_info)
         self._viewer.lod_info_changed.connect(
-            lambda m: self._status(m) if "LOD" in m or "Building" in m else None
+            lambda m: self._status(m) if "LOD" in m or "Building" in m or "Octree" in m else None
         )
 
         splitter.addWidget(self._sidebar)
@@ -175,7 +214,6 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._progress_bar)
 
     def _build_shortcuts(self):
-        # Ctrl+Z also available outside the menu (catches focus in viewer)
         undo_sc = QShortcut(QKeySequence("Ctrl+Z"), self)
         undo_sc.activated.connect(self._undo)
 
@@ -190,6 +228,15 @@ class MainWindow(QMainWindow):
             self._current_result = None
             self._sidebar.set_file(path)
             self._status("File loaded — configure options and click Segment.")
+            self._load_panoramas(path)
+
+    def _load_panoramas(self, path: str) -> None:
+        try:
+            from processing.panorama import extract_panoramas
+            self._panoramas = extract_panoramas(path)
+        except Exception:
+            self._panoramas = []
+        self._sidebar.set_pano_count(len(self._panoramas))
 
     def _start_segmentation(self, scan_type: str, params: dict):
         if not self._current_file:
@@ -217,6 +264,7 @@ class MainWindow(QMainWindow):
         self._current_result = result
         self._sidebar.set_result(result)
         self._viewer.display_result(result)
+        self._sidebar.set_measure_tool_enabled(True)
         self._progress_bar.setVisible(False)
         counts = result.point_counts()
         self._status(
@@ -244,11 +292,11 @@ class MainWindow(QMainWindow):
     def _on_tool_activated(self, tool: str):
         self._viewer.set_tool(tool)
         hints = {
-            "polygon":  "Polygon — click to add vertices, double-click or Enter to finish.  "
-                        "Drag as normal to orbit.",
-            "limit_box":"Limit Box — drag the handles in the 3D view to clip the cloud.",
-            "wand":     "Magic Wand — click a point to grow a radius selection.",
-            "none":     "Ready.",
+            "polygon":   "Polygon — click to add vertices, double-click or Enter to finish.  "
+                         "Drag as normal to orbit.",
+            "limit_box": "Limit Box — drag the handles in the 3D view to clip the cloud.",
+            "wand":      "Magic Wand — click a point to grow a radius selection.",
+            "none":      "Ready.",
         }
         self._status(hints.get(tool, "Ready."))
 
@@ -271,6 +319,20 @@ class MainWindow(QMainWindow):
         self._sidebar.set_undo_available(self._viewer.can_undo())
         self._status("Undo.")
 
+    # ── Panorama ───────────────────────────────────────────────────────────
+
+    def _on_pano_show(self, scan_index: int, opacity: float) -> None:
+        if 0 <= scan_index < len(self._panoramas):
+            self._viewer.show_panorama(self._panoramas[scan_index], opacity)
+        else:
+            self._status("No panorama available for that scan index.")
+
+    # ── Measurements ───────────────────────────────────────────────────────
+
+    def _on_measurement_done(self, result) -> None:
+        self._sidebar.add_measurement(result)
+        self._status(f"Measurement: {result.label}")
+
     # ── Export & view ──────────────────────────────────────────────────────
 
     def _export_ply(self):
@@ -281,7 +343,6 @@ class MainWindow(QMainWindow):
         )
         if path:
             from processing.exporter import export_labeled_ply
-            # If the user has manually edited labels in the viewer, pull them back
             if self._viewer._labels is not None:
                 self._current_result.labels = self._viewer._labels.copy()
             export_labeled_ply(self._current_result, path)

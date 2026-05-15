@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QGroupBox, QDoubleSpinBox, QFormLayout, QFrame,
     QSizePolicy, QSpacerItem, QScrollArea, QCheckBox, QButtonGroup,
+    QSlider, QListWidget,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -33,14 +34,29 @@ class Sidebar(QWidget):
     wand_radius_changed       = Signal(float)
     wand_same_label_changed   = Signal(bool)
     edl_toggled               = Signal(bool)
-    lod_override_changed      = Signal(object)   # int level or None
+    lod_override_changed      = Signal(object)    # kept for compatibility
     export_ply_requested      = Signal()
     export_json_requested     = Signal()
+
+    # Rendering tunables
+    lod_threshold_changed     = Signal(int)       # px
+    max_pts_changed           = Signal(int)
+    point_size_changed        = Signal(object)    # float or None
+    bg_color_changed          = Signal(str)       # hex string
+
+    # Panorama
+    pano_show_requested       = Signal(int, float)  # scan_index, opacity
+    pano_hide_requested       = Signal()
+
+    # Measurements
+    measure_tool_changed      = Signal(str)
+    clear_measurements_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(296)
-        self._active_tool = "none"
+        self._active_tool         = "none"
+        self._active_measure_tool = "none"
         self._build_ui()
 
     # ── Build ──────────────────────────────────────────────────────────────
@@ -61,7 +77,9 @@ class Sidebar(QWidget):
         root.addWidget(self._build_options_group())
         root.addWidget(self._build_segment_btn())
         root.addWidget(self._build_results_group())
-        root.addWidget(self._build_performance_group())
+        root.addWidget(self._build_rendering_group())
+        root.addWidget(self._build_panorama_group())
+        root.addWidget(self._build_measure_group())
         root.addWidget(self._build_edit_group())
         root.addWidget(self._build_legend_group())
         root.addWidget(self._build_export_group())
@@ -148,12 +166,12 @@ class Sidebar(QWidget):
 
         return g
 
-    def _build_performance_group(self) -> QGroupBox:
+    def _build_rendering_group(self) -> QGroupBox:
         g = QGroupBox("Rendering")
         l = QVBoxLayout(g)
         l.setSpacing(6)
 
-        # LOD info
+        # LOD info label
         self._lod_label = QLabel("LOD: —")
         self._lod_label.setStyleSheet("color:#888;font-size:10px;")
         l.addWidget(self._lod_label)
@@ -162,44 +180,169 @@ class Sidebar(QWidget):
         self._edl_chk = QCheckBox("Eye-Dome Lighting (EDL)")
         self._edl_chk.setChecked(True)
         self._edl_chk.setToolTip(
-            "Screen-space depth shader — makes sparse LOD look as dense as full "
-            "resolution.  Highly recommended; costs almost nothing."
+            "Screen-space depth shader — makes sparse LOD look as dense as "
+            "full resolution. Highly recommended."
         )
         self._edl_chk.toggled.connect(self.edl_toggled)
         l.addWidget(self._edl_chk)
 
-        # LOD override
-        lod_row = QHBoxLayout()
-        lod_row.addWidget(QLabel("LOD override:"))
-        self._lod_combo = QComboBox()
-        self._lod_combo.addItem("Auto", None)
-        for i, label in enumerate(["Full res", "15 mm", "50 mm", "150 mm", "500 mm"]):
-            self._lod_combo.addItem(f"{i} — {label}", i)
-        self._lod_combo.currentIndexChanged.connect(self._on_lod_override)
-        lod_row.addWidget(self._lod_combo)
-        l.addLayout(lod_row)
+        # LOD quality slider
+        self._lod_quality_label = QLabel("Quality: 80 px — higher = more detail")
+        self._lod_quality_label.setStyleSheet("color:#aaa;font-size:10px;")
+        l.addWidget(self._lod_quality_label)
+        self._lod_quality_slider = QSlider(Qt.Horizontal)
+        self._lod_quality_slider.setRange(20, 200)
+        self._lod_quality_slider.setValue(80)
+        self._lod_quality_slider.setTickInterval(20)
+        self._lod_quality_slider.valueChanged.connect(self._on_lod_quality_changed)
+        l.addWidget(self._lod_quality_slider)
+
+        # Max render pts
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Max pts:"))
+        self._max_pts_combo = QComboBox()
+        _max_pts_options = [
+            ("500 K",  500_000),
+            ("1 M",  1_000_000),
+            ("2 M",  2_000_000),
+            ("4 M",  4_000_000),
+            ("8 M",  8_000_000),
+        ]
+        for label, value in _max_pts_options:
+            self._max_pts_combo.addItem(label, value)
+        self._max_pts_combo.setCurrentIndex(3)  # default 4 M
+        self._max_pts_combo.currentIndexChanged.connect(self._on_max_pts_changed)
+        row1.addWidget(self._max_pts_combo)
+        l.addLayout(row1)
+
+        # Point size
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Point size:"))
+        self._pt_size_combo = QComboBox()
+        _pt_size_options = [
+            ("Auto", None),
+            ("1",    1.0),
+            ("1.5",  1.5),
+            ("2",    2.0),
+            ("3",    3.0),
+            ("4",    4.0),
+            ("5",    5.0),
+        ]
+        for label, value in _pt_size_options:
+            self._pt_size_combo.addItem(label, value)
+        self._pt_size_combo.setCurrentIndex(0)
+        self._pt_size_combo.currentIndexChanged.connect(self._on_pt_size_changed)
+        row2.addWidget(self._pt_size_combo)
+        l.addLayout(row2)
+
+        # Background
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Background:"))
+        self._bg_combo = QComboBox()
+        _bg_options = [
+            ("Dark (default)", "#0f1117"),
+            ("Black",          "#000000"),
+            ("Grey",           "#444444"),
+            ("White",          "#ffffff"),
+        ]
+        for label, value in _bg_options:
+            self._bg_combo.addItem(label, value)
+        self._bg_combo.setCurrentIndex(0)
+        self._bg_combo.currentIndexChanged.connect(self._on_bg_changed)
+        row3.addWidget(self._bg_combo)
+        l.addLayout(row3)
 
         return g
 
-    def _on_lod_override(self, _idx) -> None:
-        self.lod_override_changed.emit(self._lod_combo.currentData())
+    def _build_panorama_group(self) -> QGroupBox:
+        g = QGroupBox("Panorama")
+        l = QVBoxLayout(g)
+        l.setSpacing(6)
 
-    def set_lod_info(self, msg: str) -> None:
-        self._lod_label.setText(f"Rendering: {msg}")
+        self._pano_count_label = QLabel("0 panoramas found")
+        self._pano_count_label.setStyleSheet("color:#888;font-size:10px;")
+        l.addWidget(self._pano_count_label)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Scan:"))
+        self._pano_combo = QComboBox()
+        row1.addWidget(self._pano_combo)
+        l.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Opacity:"))
+        self._pano_opacity_slider = QSlider(Qt.Horizontal)
+        self._pano_opacity_slider.setRange(10, 100)
+        self._pano_opacity_slider.setValue(100)
+        row2.addWidget(self._pano_opacity_slider)
+        l.addLayout(row2)
+
+        btns = QHBoxLayout()
+        self._pano_show_btn = QPushButton("Show")
+        self._pano_hide_btn = QPushButton("Hide")
+        self._pano_show_btn.clicked.connect(self._on_pano_show)
+        self._pano_hide_btn.clicked.connect(self.pano_hide_requested)
+        btns.addWidget(self._pano_show_btn)
+        btns.addWidget(self._pano_hide_btn)
+        l.addLayout(btns)
+
+        return g
+
+    def _build_measure_group(self) -> QGroupBox:
+        g = QGroupBox("Measurements")
+        l = QVBoxLayout(g)
+        l.setSpacing(6)
+
+        # Tool buttons
+        tool_row = QHBoxLayout()
+        tool_row.setSpacing(4)
+        self._measure_btns: dict[str, QPushButton] = {}
+        self._measure_btn_group = QButtonGroup(self)
+        self._measure_btn_group.setExclusive(False)
+
+        for tool_id, label in [("distance", "Distance"), ("diameter", "Diameter"), ("area", "Area")]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(28)
+            btn.toggled.connect(lambda checked, t=tool_id: self._on_measure_tool_toggled(t, checked))
+            self._measure_btns[tool_id] = btn
+            tool_row.addWidget(btn)
+
+        l.addLayout(tool_row)
+
+        hint = QLabel(
+            "Distance: pick 2 pts  |  Diameter/Area: pick pts + Enter"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        l.addWidget(hint)
+
+        # Results list
+        self._measure_list = QListWidget()
+        self._measure_list.setMaximumHeight(120)
+        self._measure_list.setStyleSheet("font-size:11px;")
+        l.addWidget(self._measure_list)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.setFixedHeight(26)
+        clear_btn.clicked.connect(self._on_clear_measurements)
+        l.addWidget(clear_btn)
+
+        return g
 
     def _build_edit_group(self) -> QGroupBox:
         g = QGroupBox("Edit Tools")
         root = QVBoxLayout(g)
         root.setSpacing(8)
 
-        # ── Tool palette ──
+        # Tool palette
         palette = QHBoxLayout()
         palette.setSpacing(4)
 
         btn_defs = [
-            ("polygon",  "Polygon",   "Click to place vertices\nDouble-click or Enter to close"),
-            ("limit_box","Limit Box", "Drag handles to clip the view\nPoints outside are hidden"),
-            ("wand",     "Wand",      "Click a seed point to grow\na region-based selection"),
+            ("polygon",   "Polygon",   "Click to place vertices\nDouble-click or Enter to close"),
+            ("limit_box", "Limit Box", "Drag handles to clip the view\nPoints outside are hidden"),
+            ("wand",      "Wand",      "Click a seed point to grow\na region-based selection"),
         ]
         self._tool_btns: dict[str, QPushButton] = {}
         self._tool_group = QButtonGroup(self)
@@ -215,18 +358,18 @@ class Sidebar(QWidget):
 
         root.addLayout(palette)
 
-        # ── Hint label ──
+        # Hint label
         self._tool_hint = QLabel("")
         self._tool_hint.setWordWrap(True)
         self._tool_hint.setStyleSheet("color:#666;font-size:10px;")
         root.addWidget(self._tool_hint)
 
-        # ── Selection info ──
+        # Selection info
         self._sel_label = QLabel("No points selected")
         self._sel_label.setStyleSheet("color:#aaa;font-size:11px;")
         root.addWidget(self._sel_label)
 
-        # ── Wand options (shown only when wand active) ──
+        # Wand options
         self._wand_widget = QWidget()
         wl = QFormLayout(self._wand_widget)
         wl.setContentsMargins(0, 0, 0, 0)
@@ -241,7 +384,7 @@ class Sidebar(QWidget):
         self._wand_widget.setVisible(False)
         root.addWidget(self._wand_widget)
 
-        # ── Limit box controls ──
+        # Limit box controls
         self._box_widget = QWidget()
         bl = QVBoxLayout(self._box_widget)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -251,7 +394,7 @@ class Sidebar(QWidget):
         self._box_widget.setVisible(False)
         root.addWidget(self._box_widget)
 
-        # ── Label assignment buttons ──
+        # Label assignment buttons
         self._label_widget = QWidget()
         ll = QVBoxLayout(self._label_widget)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -339,7 +482,6 @@ class Sidebar(QWidget):
 
     def _on_tool_toggled(self, tool_id: str, checked: bool) -> None:
         if checked:
-            # Uncheck all other tool buttons
             for tid, btn in self._tool_btns.items():
                 if tid != tool_id:
                     btn.blockSignals(True)
@@ -347,7 +489,6 @@ class Sidebar(QWidget):
                     btn.blockSignals(False)
             self._active_tool = tool_id
         else:
-            # If we just unchecked the active tool, go to "none"
             if self._active_tool == tool_id:
                 self._active_tool = "none"
 
@@ -357,18 +498,55 @@ class Sidebar(QWidget):
     def _on_reset_box(self):
         self.reset_box_requested.emit()
 
+    def _on_lod_quality_changed(self, value: int) -> None:
+        self._lod_quality_label.setText(f"Quality: {value} px — higher = more detail")
+        self.lod_threshold_changed.emit(value)
+
+    def _on_max_pts_changed(self, _idx: int) -> None:
+        self.max_pts_changed.emit(self._max_pts_combo.currentData())
+
+    def _on_pt_size_changed(self, _idx: int) -> None:
+        self.point_size_changed.emit(self._pt_size_combo.currentData())
+
+    def _on_bg_changed(self, _idx: int) -> None:
+        self.bg_color_changed.emit(self._bg_combo.currentData())
+
+    def _on_pano_show(self):
+        idx = self._pano_combo.currentData()
+        if idx is None:
+            idx = 0
+        opacity = self._pano_opacity_slider.value() / 100.0
+        self.pano_show_requested.emit(idx, opacity)
+
+    def _on_measure_tool_toggled(self, tool_id: str, checked: bool) -> None:
+        if checked:
+            for tid, btn in self._measure_btns.items():
+                if tid != tool_id:
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+            self._active_measure_tool = tool_id
+        else:
+            if self._active_measure_tool == tool_id:
+                self._active_measure_tool = "none"
+        self.measure_tool_changed.emit(self._active_measure_tool)
+
+    def _on_clear_measurements(self):
+        self._measure_list.clear()
+        self.clear_measurements_requested.emit()
+
     # ── Tool UI visibility ─────────────────────────────────────────────────
 
     def _update_tool_ui(self):
         hints = {
-            "polygon":  "Click to add vertices · Shift+click adds to selection\n"
-                        "Double-click or Enter to finish · Escape to cancel\n"
-                        "Drag to orbit as normal between clicks",
-            "limit_box":"Drag the box handles to clip the visible cloud.\n"
-                        "Points outside are hidden but not deleted.",
-            "wand":     "Click any point to grow a radius selection.\n"
-                        "Shift+click adds to existing selection.",
-            "none":     "",
+            "polygon":   "Click to add vertices · Shift+click adds to selection\n"
+                         "Double-click or Enter to finish · Escape to cancel\n"
+                         "Drag to orbit as normal between clicks",
+            "limit_box": "Drag the box handles to clip the visible cloud.\n"
+                         "Points outside are hidden but not deleted.",
+            "wand":      "Click any point to grow a radius selection.\n"
+                         "Shift+click adds to existing selection.",
+            "none":      "",
         }
         tool = self._active_tool
         self._tool_hint.setText(hints.get(tool, ""))
@@ -416,6 +594,11 @@ class Sidebar(QWidget):
         self._export_json_btn.setEnabled(True)
         for btn in self._tool_btns.values():
             btn.setEnabled(True)
+        for btn in self._measure_btns.values():
+            btn.setEnabled(True)
+
+    def set_lod_info(self, msg: str) -> None:
+        self._lod_label.setText(f"Rendering: {msg}")
 
     def update_selection_count(self, count: int) -> None:
         if count == 0:
@@ -429,6 +612,21 @@ class Sidebar(QWidget):
 
     def set_undo_available(self, available: bool) -> None:
         self._undo_btn.setEnabled(available)
+
+    def set_pano_count(self, n: int) -> None:
+        self._pano_count_label.setText(f"{n} panorama{'s' if n != 1 else ''} found")
+        self._pano_combo.clear()
+        for i in range(n):
+            self._pano_combo.addItem(f"Scan {i}", i)
+
+    def add_measurement(self, result) -> None:
+        """Append a MeasurementResult to the list widget."""
+        self._measure_list.addItem(result.label)
+        self._measure_list.scrollToBottom()
+
+    def set_measure_tool_enabled(self, enabled: bool) -> None:
+        for btn in self._measure_btns.values():
+            btn.setEnabled(enabled)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

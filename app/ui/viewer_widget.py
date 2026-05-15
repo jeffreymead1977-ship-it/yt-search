@@ -1,27 +1,31 @@
-"""
-Embedded PyVista point cloud viewer.
+"""Embedded PyVista point cloud viewer.
 
 Performance features
 --------------------
-- Eye-Dome Lighting (EDL) — screen-space depth shader; makes sparse LOD
-  look as good as full density.  One call to enable.
-- Multi-level LOD — pre-built at load time; at render time the appropriate
-  level (0 finest → 4 coarsest) is chosen from camera distance.
-- Adaptive point size — fewer points on screen → larger points, so the
-  screen always looks filled.
-- Camera-driven rendering — only re-render when the camera moves; a 150 ms
-  debounce after movement ends triggers a full LOD refresh.  During
-  interaction the current cloud stays frozen so the frame rate stays high.
+- Eye-Dome Lighting (EDL) — screen-space depth shader.
+- Octree LOD — spatially adaptive; close geometry = fine detail, far = coarse.
+- Adaptive point size — fewer points → larger points.
+- Camera-driven rendering — 150 ms debounce after movement ends.
 
 Edit tools
 ----------
-- polygon   — click vertices, orbit between them, double-click / Enter to
-              close; numpy ray-casting selection in screen space.
-- limit_box — interactive axis-aligned clip box; hides points outside.
+- polygon   — click vertices, double-click / Enter to close.
+- limit_box — interactive axis-aligned clip box.
 - wand      — KDTree radius-grow from a clicked seed point.
+
+Measurement tools
+-----------------
+- distance  — pick 2 points → Euclidean distance.
+- diameter  — pick N points + Enter → cylinder fit.
+- area      — pick N points + Enter → plane fit + convex hull.
+
+Panorama
+--------
+- show_panorama / hide_panorama — textured sphere inside the cloud.
 """
 from __future__ import annotations
 
+import math
 import numpy as np
 from typing import Optional
 
@@ -29,7 +33,10 @@ from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QThread
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from ui.polygon_overlay import PolygonOverlay
-from processing.lod import PointCloudLOD, quick_sample, adaptive_point_size
+from processing.octree_lod import (
+    OctreeNode, build_octree, collect_indices,
+    get_frustum_planes, adaptive_point_size,
+)
 
 try:
     import pyvista as pv
@@ -42,14 +49,21 @@ except ImportError:
 
 from models.tank_scan import SegmentationResult, Label, LABEL_COLORS
 
-_SEL_RGB   = np.array([255, 230, 40], dtype=np.uint8)
-_CLICK_TOL = 5      # pixels — below → click, above → drag/orbit
-_LOD_DEBOUNCE_MS = 150   # ms after camera stops before LOD refresh
+_SEL_RGB         = np.array([255, 230, 40], dtype=np.uint8)
+_CLICK_TOL       = 5      # pixels — below → click, above → drag/orbit
+_LOD_DEBOUNCE_MS = 150    # ms after camera stops before LOD refresh
+
+# Quick uniform subsample for instant preview before octree is ready
+def _quick_sample(pts: np.ndarray, target: int = 200_000) -> np.ndarray:
+    n    = len(pts)
+    step = max(1, n // target)
+    return np.arange(0, n, step, dtype=np.intp)
 
 
 class ViewerWidget(QWidget):
-    selection_changed  = Signal(int)    # count of selected points
-    lod_info_changed   = Signal(str)    # e.g. "LOD 2 — 1.2 M pts"
+    selection_changed  = Signal(int)     # count of selected points
+    lod_info_changed   = Signal(str)     # e.g. "Octree — 1.2 M pts"
+    measurement_done   = Signal(object)  # MeasurementResult
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,12 +79,14 @@ class ViewerWidget(QWidget):
         self._undo_stack: list[np.ndarray] = []
         self._cloud_actor = None
 
-        # ── LOD state ─────────────────────────────────────────────────────
-        self._lod: Optional[PointCloudLOD] = None
+        # ── octree LOD state ──────────────────────────────────────────────
+        self._octree: Optional[OctreeNode] = None
         self._lod_thread: Optional[QThread] = None
         self._lod_worker = None
         self._edl_enabled = True
-        self._force_lod:   Optional[int] = None
+        self._lod_threshold_px: float = 80.0
+        self._max_pts: int = 4_000_000
+        self._point_size_override: Optional[float] = None
         self._lod_timer = QTimer(self)
         self._lod_timer.setSingleShot(True)
         self._lod_timer.timeout.connect(self._on_lod_timer)
@@ -85,6 +101,14 @@ class ViewerWidget(QWidget):
         self._wand_same_label = True
         self._kdtree          = None
         self._clip_active     = False
+
+        # ── measurement state ─────────────────────────────────────────────
+        self._measure_tool: str = "none"
+        self._measure_picks: list[np.ndarray] = []
+        self._measure_actors: list = []
+
+        # ── panorama state ────────────────────────────────────────────────
+        self._pano_actor = None
 
         if _PYVISTA_OK:
             self._plotter = QtInteractor(self)
@@ -106,7 +130,7 @@ class ViewerWidget(QWidget):
             ))
 
     # ══════════════════════════════════════════════════════════════════════
-    # Public API
+    # Public API — data
     # ══════════════════════════════════════════════════════════════════════
 
     def display_result(self, result: SegmentationResult) -> None:
@@ -118,17 +142,20 @@ class ViewerWidget(QWidget):
         self._clip_mask = None
         self._undo_stack.clear()
         self._kdtree = None
-        self._lod = None
+        self._octree = None
         self._polygon_verts.clear()
         if self._overlay:
             self._overlay.clear()
 
-        # Show a quick preview immediately, then build LOD in background
-        self._visible_indices = quick_sample(self._pts, 200_000)
+        self._visible_indices = _quick_sample(self._pts, 200_000)
         self._render_indices(self._visible_indices, reset_camera=True)
-        self.lod_info_changed.emit("Building LOD…")
+        self.lod_info_changed.emit("Building octree…")
 
         self._start_lod_build()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Public API — edit tools
+    # ══════════════════════════════════════════════════════════════════════
 
     def set_tool(self, tool: str) -> None:
         if not self._plotter or self._pts is None:
@@ -172,7 +199,7 @@ class ViewerWidget(QWidget):
         self.selection_changed.emit(0)
 
     def reset_limit_box(self) -> None:
-        self._clip_mask  = None
+        self._clip_mask   = None
         self._clip_active = False
         try:
             self._plotter.clear_box_widgets()
@@ -193,6 +220,10 @@ class ViewerWidget(QWidget):
     def can_undo(self) -> bool:
         return bool(self._undo_stack)
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Public API — rendering tunables
+    # ══════════════════════════════════════════════════════════════════════
+
     def set_edl(self, enabled: bool) -> None:
         self._edl_enabled = enabled
         if not self._plotter:
@@ -203,10 +234,26 @@ class ViewerWidget(QWidget):
             self._plotter.disable_eye_dome_lighting()
         self._plotter.render()
 
-    def set_force_lod(self, level: Optional[int]) -> None:
-        """Override automatic LOD level. None = automatic."""
-        self._force_lod = level
+    def set_lod_threshold(self, px: int) -> None:
+        self._lod_threshold_px = float(px)
         self._full_lod_refresh()
+
+    def set_max_pts(self, n: int) -> None:
+        self._max_pts = n
+        self._full_lod_refresh()
+
+    def set_background_color(self, hex_color: str) -> None:
+        if self._plotter:
+            self._plotter.set_background(hex_color)
+            self._plotter.render()
+
+    def set_point_size_override(self, v: Optional[float]) -> None:
+        self._point_size_override = v
+        self._refresh_display()
+
+    def set_force_lod(self, level: Optional[int]) -> None:
+        """Legacy compatibility — ignored; octree uses spatial threshold."""
+        pass
 
     def set_wand_radius(self, r: float) -> None:
         self._wand_radius = r
@@ -215,13 +262,69 @@ class ViewerWidget(QWidget):
         self._wand_same_label = v
 
     # ══════════════════════════════════════════════════════════════════════
+    # Public API — panorama
+    # ══════════════════════════════════════════════════════════════════════
+
+    def show_panorama(self, pano, opacity: float = 1.0) -> None:
+        """Display a textured panoramic sphere. pano is a PanoramaData."""
+        if not self._plotter:
+            return
+        self.hide_panorama()
+        try:
+            from processing.panorama import make_panorama_sphere
+            sphere, texture = make_panorama_sphere(pano)
+            self._pano_actor = self._plotter.add_mesh(
+                sphere,
+                texture=texture,
+                opacity=opacity,
+                lighting=False,
+            )
+            self._plotter.render()
+        except Exception:
+            pass
+
+    def hide_panorama(self) -> None:
+        if self._pano_actor is not None and self._plotter:
+            try:
+                self._plotter.remove_actor(self._pano_actor)
+            except Exception:
+                pass
+            self._pano_actor = None
+            self._plotter.render()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Public API — measurements
+    # ══════════════════════════════════════════════════════════════════════
+
+    def set_measure_tool(self, tool: str) -> None:
+        """Set active measurement tool: "distance", "diameter", "area", "none"."""
+        self._measure_tool = tool
+        self._measure_picks.clear()
+        if tool != "none":
+            self._install_vtk_observers()
+        else:
+            if self._tool == "none":
+                self._remove_vtk_observers()
+
+    def clear_measurements(self) -> None:
+        if self._plotter:
+            for actor in self._measure_actors:
+                try:
+                    self._plotter.remove_actor(actor)
+                except Exception:
+                    pass
+        self._measure_actors.clear()
+        self._measure_picks.clear()
+        if self._plotter:
+            self._plotter.render()
+
+    # ══════════════════════════════════════════════════════════════════════
     # LOD build
     # ══════════════════════════════════════════════════════════════════════
 
     def _start_lod_build(self) -> None:
         if self._pts is None:
             return
-        # Abort previous build if running
         if self._lod_thread and self._lod_thread.isRunning():
             self._lod_thread.quit()
             self._lod_thread.wait(1000)
@@ -238,8 +341,8 @@ class ViewerWidget(QWidget):
         self._lod_worker.finished.connect(self._lod_thread.quit)
         self._lod_thread.start()
 
-    def _on_lod_built(self, lod: PointCloudLOD) -> None:
-        self._lod = lod
+    def _on_lod_built(self, octree: OctreeNode) -> None:
+        self._octree = octree
         self._lod_thread = None
         self._lod_worker = None
         self._full_lod_refresh()
@@ -254,7 +357,6 @@ class ViewerWidget(QWidget):
         )
 
     def _on_camera_moved(self, *_) -> None:
-        # Debounce: re-render LOD 150 ms after camera stops
         self._lod_timer.stop()
         self._lod_timer.start(_LOD_DEBOUNCE_MS)
 
@@ -262,16 +364,20 @@ class ViewerWidget(QWidget):
         self._full_lod_refresh()
 
     # ══════════════════════════════════════════════════════════════════════
-    # VTK observers (polygon + wand)
+    # VTK observers (polygon + wand + measurements)
     # ══════════════════════════════════════════════════════════════════════
 
     def _install_vtk_observers(self) -> None:
+        if self._press_obs is not None:
+            return  # already installed
         iren = self._plotter.iren
         self._press_obs   = iren.AddObserver("LeftButtonPressEvent",   self._on_lmb_press)
         self._release_obs = iren.AddObserver("LeftButtonReleaseEvent", self._on_lmb_release)
         self._key_obs     = iren.AddObserver("KeyPressEvent",          self._on_key_press)
 
     def _remove_vtk_observers(self) -> None:
+        if self._measure_tool != "none":
+            return  # keep observers for measurement
         iren = self._plotter.iren
         for attr in ("_press_obs", "_release_obs", "_key_obs"):
             obs = getattr(self, attr, None)
@@ -289,22 +395,29 @@ class ViewerWidget(QWidget):
         if self._press_pos is None:
             return
         pos = caller.GetEventPosition()
-        if abs(pos[0]-self._press_pos[0]) > _CLICK_TOL or \
-           abs(pos[1]-self._press_pos[1]) > _CLICK_TOL:
+        if (abs(pos[0] - self._press_pos[0]) > _CLICK_TOL or
+                abs(pos[1] - self._press_pos[1]) > _CLICK_TOL):
             self._press_pos = None
-            return   # it was a drag
+            return   # drag/orbit
         self._press_pos = None
-        if self._tool == "polygon":
+
+        if self._measure_tool != "none":
+            self._measure_pick(pos)
+        elif self._tool == "polygon":
             self._polygon_add_vertex(pos)
         elif self._tool == "wand":
             self._wand_pick(pos)
 
     def _on_key_press(self, caller, _event) -> None:
         key = caller.GetKeySym()
-        if key in ("Return", "KP_Enter") and self._tool == "polygon":
-            self._polygon_close()
+        if key in ("Return", "KP_Enter"):
+            if self._measure_tool in ("diameter", "area"):
+                self._measure_finish()
+            elif self._tool == "polygon":
+                self._polygon_close()
         elif key == "Escape":
             self._polygon_verts.clear()
+            self._measure_picks.clear()
             if self._overlay:
                 self._overlay.clear()
 
@@ -449,6 +562,73 @@ class ViewerWidget(QWidget):
         self.selection_changed.emit(int(self._selected.sum()))
 
     # ══════════════════════════════════════════════════════════════════════
+    # Measurement picking
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _measure_pick(self, screen_pos: tuple[int, int]) -> None:
+        """Pick a 3D world point and accumulate for the active measurement tool."""
+        if not self._plotter:
+            return
+        picker = vtkPointPicker()
+        picker.SetTolerance(0.025)
+        picked = picker.Pick(screen_pos[0], screen_pos[1], 0, self._plotter.renderer)
+        if not picked:
+            return
+        world_pt = np.array(picker.GetPickPosition(), dtype=np.float64)
+
+        self._measure_picks.append(world_pt)
+
+        if self._measure_tool == "distance" and len(self._measure_picks) >= 2:
+            self._measure_finish()
+
+    def _measure_finish(self) -> None:
+        """Compute and emit measurement from accumulated picks."""
+        picks = self._measure_picks
+        tool  = self._measure_tool
+
+        if tool == "distance" and len(picks) >= 2:
+            from processing.measure import measure_distance
+            result = measure_distance(picks[0], picks[1])
+        elif tool == "diameter" and len(picks) >= 3:
+            from processing.measure import measure_diameter
+            pts = np.array(picks)
+            result = measure_diameter(pts)
+        elif tool == "area" and len(picks) >= 3:
+            from processing.measure import measure_area
+            pts = np.array(picks)
+            result = measure_area(pts)
+        else:
+            return
+
+        self._measure_picks.clear()
+        self._draw_measurement(result)
+        self.measurement_done.emit(result)
+
+    def _draw_measurement(self, result) -> None:
+        """Draw annotation geometry for a measurement result."""
+        if not self._plotter or not result.annotation_pts:
+            return
+        pts = result.annotation_pts
+        try:
+            if len(pts) == 2:
+                line = pv.Line(pts[0], pts[1])
+                actor = self._plotter.add_mesh(
+                    line, color="yellow", line_width=2, lighting=False
+                )
+                self._measure_actors.append(actor)
+            elif len(pts) >= 3:
+                arr = np.array(pts)
+                cloud = pv.PolyData(arr.astype(np.float32))
+                actor = self._plotter.add_mesh(
+                    cloud, color="yellow", point_size=8,
+                    render_points_as_spheres=True, lighting=False
+                )
+                self._measure_actors.append(actor)
+            self._plotter.render()
+        except Exception:
+            pass
+
+    # ══════════════════════════════════════════════════════════════════════
     # Rendering
     # ══════════════════════════════════════════════════════════════════════
 
@@ -462,26 +642,47 @@ class ViewerWidget(QWidget):
         return colors
 
     def _full_lod_refresh(self) -> None:
-        """Pick LOD level from camera position and re-render."""
+        """Pick octree indices from camera + frustum and re-render."""
         if not self._plotter or self._pts is None:
             return
 
-        if self._lod is not None:
+        if self._octree is not None:
             try:
-                cam = np.array(self._plotter.camera_position[0])
+                cam_pos = np.array(self._plotter.camera_position[0], dtype=np.float64)
             except Exception:
-                cam = self._lod.center + np.array([0, 0, self._lod.radius * 3])
-            idx, lv = self._lod.select(
-                cam,
-                clip_mask=self._clip_mask,
-                force_level=self._force_lod,
+                cam_pos = self._octree.center + np.array([0, 0, self._octree.half_diag * 3])
+
+            try:
+                frustum = get_frustum_planes(self._plotter.renderer)
+            except Exception:
+                frustum = np.zeros((6, 4))
+                frustum[:, 3] = 1e9  # degenerate: accept everything
+
+            win_h = float(self._plotter.renderer.GetRenderWindow().GetSize()[1])
+            if win_h < 1:
+                win_h = 600.0
+
+            fov_deg = self._plotter.renderer.GetActiveCamera().GetViewAngle()
+            fov_rad = math.radians(fov_deg)
+            fov_half_tan = math.tan(fov_rad / 2.0)
+
+            idx = collect_indices(
+                self._octree,
+                cam_pos,
+                frustum,
+                win_h,
+                fov_half_tan,
+                threshold_px=self._lod_threshold_px,
+                max_pts=self._max_pts,
             )
+
+            if self._clip_mask is not None and len(idx) > 0:
+                idx = idx[self._clip_mask[idx]]
+
             n_shown = len(idx)
-            level_names = ["Full res", "15 mm", "50 mm", "150 mm", "500 mm"]
-            name = level_names[min(lv, len(level_names)-1)]
-            self.lod_info_changed.emit(f"{name} — {n_shown:,} pts")
+            self.lod_info_changed.emit(f"Octree LOD — {n_shown:,} pts")
         else:
-            idx = quick_sample(self._pts, 200_000)
+            idx = _quick_sample(self._pts, 200_000)
             if self._clip_mask is not None:
                 idx = idx[self._clip_mask[idx]]
             self.lod_info_changed.emit(f"Preview — {len(idx):,} pts")
@@ -511,11 +712,16 @@ class ViewerWidget(QWidget):
         cloud = pv.PolyData(pts_vis)
         cloud['colors'] = colors_vis
 
+        if self._point_size_override is not None:
+            pt_size = self._point_size_override
+        else:
+            pt_size = adaptive_point_size(len(idx))
+
         self._cloud_actor = self._plotter.add_mesh(
             cloud,
             scalars='colors',
             rgb=True,
-            point_size=adaptive_point_size(len(idx)),
+            point_size=pt_size,
             render_points_as_spheres=False,
             lighting=False,
         )
@@ -567,9 +773,9 @@ class ViewerWidget(QWidget):
         vp_x    = vp[0] * win_w
         vp_y    = vp[1] * win_h
 
-        disp    = np.zeros((n, 2))
-        disp[:, 0] = (ndc[:, 0] + 1) * 0.5 * vp_w + vp_x
-        disp[:, 1] = (ndc[:, 1] + 1) * 0.5 * vp_h + vp_y
+        disp        = np.zeros((n, 2))
+        disp[:, 0]  = (ndc[:, 0] + 1) * 0.5 * vp_w + vp_x
+        disp[:, 1]  = (ndc[:, 1] + 1) * 0.5 * vp_h + vp_y
         return disp, in_front
 
     # ── Cleanup ────────────────────────────────────────────────────────────
@@ -588,7 +794,7 @@ class ViewerWidget(QWidget):
 # Pure-numpy point-in-polygon (ray-casting, no external deps)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _pts_in_polygon(polygon: list[tuple[int,int]], points: np.ndarray) -> np.ndarray:
+def _pts_in_polygon(polygon: list[tuple[int, int]], points: np.ndarray) -> np.ndarray:
     poly   = np.asarray(polygon, dtype=np.float64)
     px, py = points[:, 0], points[:, 1]
     n_v    = len(poly)
