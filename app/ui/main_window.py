@@ -139,10 +139,13 @@ class MainWindow(QMainWindow):
         self._sidebar = Sidebar()
         self._sidebar.open_requested.connect(self._open_file)
         self._sidebar.segment_requested.connect(self._start_segmentation)
-        self._sidebar.edit_mode_toggled.connect(self._on_edit_mode_toggled)
+        self._sidebar.tool_activated.connect(self._on_tool_activated)
         self._sidebar.apply_label_requested.connect(self._apply_label)
         self._sidebar.clear_selection_requested.connect(self._clear_selection)
+        self._sidebar.reset_box_requested.connect(self._viewer.reset_limit_box)
         self._sidebar.undo_requested.connect(self._undo)
+        self._sidebar.wand_radius_changed.connect(self._viewer.set_wand_radius)
+        self._sidebar.wand_same_label_changed.connect(self._viewer.set_wand_same_label)
         self._sidebar.export_ply_requested.connect(self._export_ply)
         self._sidebar.export_json_requested.connect(self._export_json)
 
@@ -230,17 +233,18 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
 
-    # ── Edit mode ──────────────────────────────────────────────────────────
+    # ── Edit tools ─────────────────────────────────────────────────────────
 
-    def _on_edit_mode_toggled(self, active: bool):
-        self._viewer.set_edit_mode(active)
-        if active:
-            self._status(
-                "Edit mode — drag to select points, Shift+drag to add.  "
-                "Click a label button to reassign."
-            )
-        else:
-            self._status("Edit mode off.")
+    def _on_tool_activated(self, tool: str):
+        self._viewer.set_tool(tool)
+        hints = {
+            "polygon":  "Polygon — click to add vertices, double-click or Enter to finish.  "
+                        "Drag as normal to orbit.",
+            "limit_box":"Limit Box — drag the handles in the 3D view to clip the cloud.",
+            "wand":     "Magic Wand — click a point to grow a radius selection.",
+            "none":     "Ready.",
+        }
+        self._status(hints.get(tool, "Ready."))
 
     def _on_selection_changed(self, count: int):
         self._sidebar.update_selection_count(count)
